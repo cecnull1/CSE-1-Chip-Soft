@@ -1,0 +1,521 @@
+class Table {
+    sine = Array.from({length: 65536}, (_, i) => sin(i*2*PI/65536)*32767+32767&0xffff)
+    tri = Array.from({length: 65536}, (_, i) => asin(sin(i*2*PI/65536))/PI*2*32767+32767&0xffff)
+    exp = Array.from({length: 65536}, (_, i) => (exp(i/65535*log(2))-1)*65535&0xffff)
+}
+
+const table = new Table()
+
+class FilterSVF {
+    cutoff = 0
+    types = 0 
+    mod = 1   
+    res = 0   
+    outL = 0
+    outR = 0
+    neg = 0
+
+    #buf1 = 0 
+    #buf2 = 0 
+    #buf3 = 0 
+    #buf4 = 0
+
+    vfbL = 0
+    vfbR = 0
+
+    clock(input, filter1, filter2, filter3) {
+        this.cutoff &= 0xFFFF
+        this.types &= 0x0007
+        this.neg &= 0x0001
+        this.mod &= 0x000F
+        this.res &= 0x00FF
+        this.outL &= 0xFFFF
+        this.outR &= 0xFFFF
+        this.#buf1 &= 0xFFFFFFFF
+        this.#buf2 &= 0xFFFFFFFF
+        this.#buf3 &= 0xFFFFFFFF
+        this.#buf4 &= 0xFFFFFFFF
+        this.vfbL &= 0xFFFF
+        this.vfbR &= 0xFFFF
+        
+        let inL = 0, inR = 0
+        if (this.mod & 1) { inL += input[0]; inR += input[1] } 
+        if (this.mod & 2) { inL += filter1.vfbL; inR += filter1.vfbR } 
+        if (this.mod & 4) { inL += filter2.vfbL; inR += filter2.vfbR } 
+        if (this.mod & 8) { inL += filter3.vfbL; inR += filter3.vfbR } 
+      
+        const f = this.cutoff
+        const q = 0x100 - this.res
+
+        const lowL = this.#buf1
+        const bandL = this.#buf2
+        const highL = inL - lowL - ((q * bandL) >> 8)
+        const newLowL = lowL + ((f * bandL) >> 16)
+        const newBandL = bandL + ((f * highL) >> 16)
+
+        
+        const lowR = this.#buf3
+        const bandR = this.#buf4
+        const highR = inR - lowR - ((q * bandR) >> 8)
+        const newLowR = lowR + ((f * bandR) >> 16)
+        const newBandR = bandR + ((f * highR) >> 16)
+
+        
+        this.#buf1 = newLowL & 0xFFFFFFFF
+        this.#buf2 = newBandL & 0xFFFFFFFF
+        this.#buf3 = newLowR & 0xFFFFFFFF
+        this.#buf4 = newBandR & 0xFFFFFFFF
+
+        
+        let outL = 0, outR = 0
+        if (this.types & 1) outL += newLowL
+        if (this.types & 2) outL += highL
+        if (this.types & 4) outL += newBandL
+        if (this.types & 1) outR += newLowR
+        if (this.types & 2) outR += highR
+        if (this.types & 4) outR += newBandR
+        if (this.types == 0) {outL += inL; outR += inR}
+
+      
+        if (this.neg) {
+            outL = -outL
+            outR = -outR
+        }
+
+        this.vfbL = outL & 0xFFFF
+        this.vfbR = outR & 0xFFFF
+
+        return [outL * this.outL >> 16, outR * this.outR >> 16]
+    }
+}
+
+class ADSR {
+    ar = 0
+    dr = 0
+    sl = 0
+    sr = 0
+    rr = 0
+    envstate = 0
+    envvp = 3
+
+    clock() {
+   	this.ar &= 0xffff
+    	this.dr &= 0xffff
+    	this.sl &= 0xffff
+    	this.sr &= 0xffff
+    	this.rr &= 0xffff
+    	this.envstate &= 0x3
+    	this.envvp &= 0xffff
+      
+      switch(this.envstate) {
+        case 0: {
+                   this.envvp += this.ar
+                   if (this.envvp > 0xffff) { this.envvp = 0xffff, this.envstate += 1}
+                   break;
+                 }
+        case 1: {
+                   this.envvp -= this.dr
+                   if (this.envvp <= this.sl) {this.envvp = this.sl, this.envstate += 1}
+                   break;
+                 }
+        case 2: {
+                   this.envvp -= this.sr
+                   if (this.envvp <= 0) { this.envvp = 0, this.envstate += 1}
+                   break;
+                }
+        case 3: {
+                   this.envvp -= this.rr
+                   if (this.envvp <= 0) { this.envvp = 0}
+                   break;
+                 }
+      }
+    }
+
+    volume(_table) {
+        if (_table === undefined || _table === null) return table.exp[this.envvp]
+        return _table[this.envvp]
+    }
+}
+
+class Oper {
+    mi1 = 0
+    mi2 = 0
+    mi3 = 0
+    mi4 = 0
+    mi5 = 0
+    mi6 = 0
+    adsr = new ADSR()
+    pitch = 0
+    vfb = 0
+    phase = 0
+    duty = 32768
+
+    outL = 0
+    outR = 0
+
+    negL = 0
+    negR = 0
+    wave = 0
+
+    envdiv = 0
+    envdivcount = 0
+
+    opn2detune = 4
+    fixed = 0
+    ml = 1
+
+    sweepFreq = 0 
+
+    wavetable(index) {
+        switch(this.wave) {
+          case 0: return table.sine[index]
+          case 1: return table.tri[index]
+          case 2: return (index>this.duty)*65535
+          case 3: return index
+          case 4:
+        		if (this.phase & 0x80000000) {
+            	this.phase &= 0x7fffffff
+            	this.duty = (this.duty >> 1) | (((this.duty ^ (this.duty >> 2) ^ (this.duty >> 3) ^ (this.duty >> 5)) & 1) << 15)
+        		}
+        		return (this.duty & 1) * 65535
+        }
+        return 0
+    }
+
+    clock(op1, op2, op3, op4, op5, op6, pitch) {
+    	this.mi1 &= 0xffff
+    	this.mi2 &= 0xffff
+    	this.mi3 &= 0xffff
+    	this.mi4 &= 0xffff
+    	this.mi5 &= 0xffff
+    	this.mi6 &= 0xffff
+    	this.pitch &= 0xffffffff
+    	this.vfb &= 0xffff
+    	this.phase &= 0xffffffff
+    	this.outL &= 0xffff
+    	this.outR &= 0xffff
+      this.negL &= 0x0001
+      this.negR &= 0x0001
+      this.wave &= 0x0007
+      this.duty &= 0xffff
+      this.envdivcount &= 0x03f
+      this.envdiv &= 0x3f
+      this.opn2detune &= 0x07
+      this.fixed &= 0x01
+      this.ml &= 0x0F
+      this.sweepFreq &= 0xFFFFFFFF
+
+      this.vfb = this.wavetable(
+        (this.phase>>>16)+
+        ((op1.vfb*op1.adsr.volume()>>>16)*this.mi1>>13)+
+        ((op2.vfb*op2.adsr.volume()>>>16)*this.mi2>>13)+
+        ((op3.vfb*op3.adsr.volume()>>>16)*this.mi3>>13)+
+        ((op4.vfb*op4.adsr.volume()>>>16)*this.mi4>>13)+
+        ((op5.vfb*op5.adsr.volume()>>>16)*this.mi5>>13)+
+        ((op6.vfb*op6.adsr.volume()>>>16)*this.mi6>>13)
+        &0xffff
+      )
+      const opitch = (this.fixed ? this.pitch : (pitch + this.pitch))
+      this.pitch += this.sweepFreq
+      this.pitch &= 0xFFFFFFFF
+		this.phase += (opitch + (this.opn2detune-4) * (opitch >> 9) & 0xFFFFFFFF) * (this.ml == 0 ? 0.5 : this.ml)
+		this.phase &= 0xffffffff
+      if (this.envdivcount++ == this.envdiv) {
+        this.envdivcount = 0
+        this.adsr.clock()
+      }
+      return [(this.negL ? -1 : 1)*((this.vfb-0x8000)*this.adsr.volume()>>16)*this.outL>>16, (this.negR ? -1 : 1)*((this.vfb-0x8000)*this.adsr.volume()>>16)*this.outR>>16] // 溢出会自动符号转换...在这里恰好是预期行为
+    }
+}
+
+class CSE1Channel {
+  op1 = new Oper()
+  op2 = new Oper()
+  op3 = new Oper()
+  op4 = new Oper()
+  op5 = new Oper()
+  op6 = new Oper()
+  f1 = new FilterSVF()
+  f2 = new FilterSVF()
+  f3 = new FilterSVF()
+  outL = 0xffff
+  outR = 0xffff
+  pitch = 0x00000000
+  sweepFreq = 0 
+  clock() {
+    this.outL &= 0xffff
+    this.outR &= 0xffff
+    this.sweepFreq &= 0xFFFFFFFF
+    const o1 = this.op1.clock(this.op1, this.op2, this.op3, this.op4, this.op5, this.op6, this.pitch)
+    const o2 = this.op2.clock(this.op1, this.op2, this.op3, this.op4, this.op5, this.op6, this.pitch)
+    const o3 = this.op3.clock(this.op1, this.op2, this.op3, this.op4, this.op5, this.op6, this.pitch)
+    const o4 = this.op4.clock(this.op1, this.op2, this.op3, this.op4, this.op5, this.op6, this.pitch)
+    const o5 = this.op5.clock(this.op1, this.op2, this.op3, this.op4, this.op5, this.op6, this.pitch)
+    const o6 = this.op6.clock(this.op1, this.op2, this.op3, this.op4, this.op5, this.op6, this.pitch)
+    const sum = [o1[0]+o2[0]+o3[0]+o4[0]+o5[0]+o6[0]>>2, o1[1]+o2[1]+o3[1]+o4[1]+o5[1]+o6[1]>>2]
+
+    const o7 = this.f1.clock(sum, this.f1, this.f2, this.f3)
+    const o8 = this.f2.clock(sum, this.f1, this.f2, this.f3)
+    const o9 = this.f3.clock(sum, this.f1, this.f2, this.f3)
+    this.pitch += this.sweepFreq
+    this.pitch &= 0xFFFFFFFF
+    return [o7[0]+o8[0]+o9[0]+(sum[0]*this.outL>>16), o7[1]+o8[1]+o9[1]+(sum[1]*this.outR>>16)]
+  }
+}
+
+class CSE1Chip {
+    channels = Array.from({length: 9}, (_, i) => new CSE1Channel())
+
+    clock() {
+        return this.channels
+			.map(c => {const dac = c.clock(); return [dac[0]/65536*2, dac[1]/65536*2]})
+			.reduce((acc, v) => [acc[0] + v[0], acc[1] + v[1]], [0, 0])
+         .map(v  => v)
+    }
+}
+
+const cse1 = new CSE1Chip()
+
+function clamp(value, min1, max2) {
+    return min(max(value, min1), max2)
+}
+
+const f=(b)=>2**((b-69)/12)
+
+const bpm = 60/8/7
+const a4 = 440
+
+const note = [
+  40, 43, 48, 45
+]
+
+const env = [
+  0x7F, 0x77, 0x7F, 0x77, 0x70, 0x6F, 0x7F, 0x77 
+]
+
+const chord = [
+  [a4*f(59), a4*f(64), a4*f(60), a4*f(60)],
+  [a4*f(55), a4*f(59), a4*f(55), a4*f(57)]
+]
+
+const notes1 = [
+f(52),f(55), f(55), f(59),
+f(55),f(59), f(59), f(64),
+f(52),f(55), f(55), f(60),
+f(52),f(57), f(57), f(60),
+]
+
+const note1=(t)=>notes1[t*2&15]*a4*2
+const note2=(t)=>notes1[(t*4&3)+(t>>1<<2)&15]*a4
+
+function CHORD______(channels, index) {
+    const op4 = channels[index].op4;
+    op4.outL = 65535
+    op4.outR = 65535;
+    op4.ml = 1;
+    op4.adsr.envvp = 65535/2;
+    op4.mi3 = 65535/8
+    op4.opn2detune = -3;
+
+    const op3 = channels[index].op3;
+    op3.ml = 1;
+    op3.adsr.envvp = 65535;
+    op3.opn2detune = 3;
+
+    const op2 = channels[index].op2;
+    op2.outL = 65535
+    op2.outR = 65535;
+    op2.ml = 2;
+    op2.adsr.envvp = 65535/2;
+    op2.mi1 = 65535/8
+    op2.opn2detune = -3;
+
+    const op1 = channels[index].op1;
+    op1.ml = 2;
+    op1.adsr.envvp = 65535;
+    op1.opn2detune = 3;
+}
+
+function SET__PITCH_(channels, index, sample, hz) {
+    channels[index].pitch = hz*2**32/sample
+}
+
+function ResetEG(channels, index) {
+    const op1 = channels[index].op1;
+    const op2 = channels[index].op2;
+    const op3 = channels[index].op3;
+	 const op4 = channels[index].op4;
+    const op5 = channels[index].op5;
+    const op6 = channels[index].op6;
+    const all = [op1, op2, op3, op4, op5, op6];
+    all.forEach((v, i, arr) => {
+        v.adsr.envstate = 0
+        v.adsr.envvp = 0
+    })
+}
+
+function SetVolume(channels, index, volume) {
+    channels[index].outL = volume
+    channels[index].outR = volume
+}
+
+function randomPhase(channels, index) {
+    const op1 = channels[index].op1;
+    const op2 = channels[index].op2;
+    const op3 = channels[index].op3;
+	 const op4 = channels[index].op4;
+    const op5 = channels[index].op5;
+    const op6 = channels[index].op6;
+    const all = [op1, op2, op3, op4, op5, op6];
+    all.forEach((v, i, arr) => {
+        v.phase = random()*2**31
+    })
+}
+
+function SUPERSAW___(channels, index) {
+    const op1 = channels[index].op1;
+    const op2 = channels[index].op2;
+    const op3 = channels[index].op3;
+	 const op4 = channels[index].op4;
+    const op5 = channels[index].op5;
+    const op6 = channels[index].op6;
+    const all = [op1, op2, op3, op4, op5, op6];
+    all.forEach((v, i, arr) => {
+        v.wave = 3
+        v.adsr.ar=65535
+        v.adsr.dr=2
+        v.outL = (i&1)*65535/1.5
+        v.outR = (i+1&1)*65535/1.5
+        v.pitch = (i-2.5)*2**33/48000
+    })
+}
+
+function KICK_______(channels, index) {
+    const op1 = channels[index].op1;
+    const op2 = channels[index].op2;
+
+    op1.adsr.ar=65535
+    op1.adsr.dr=1
+    op1.outL = op1.outR = 65535
+    op1.mi2 = 65535/4
+    op2.adsr.ar=65535
+    op2.adsr.dr=96
+    op2.ml = 2
+    op2.mi2 = 65535/4
+}
+
+function HIHAT______(channels, index) {
+    const op1 = channels[index].op1;
+
+    op1.adsr.ar=65535
+    op1.adsr.dr=12
+    op1.fixed = true
+    op1.wave = 4
+    op1.pitch = 0x7f000000
+    op1.outL = op1.outR = 65535
+}
+
+function HIHAT_OPEN_(channels, index) {
+    const op1 = channels[index].op1;
+
+    op1.adsr.ar=65535
+    op1.adsr.dr=6
+    op1.fixed = true
+    op1.wave = 4
+    op1.pitch = 0x7f000000
+    op1.outL = op1.outR = 65535
+}
+
+function SNARE______(channels, index) {
+    const op1 = channels[index].op1;
+
+    op1.adsr.ar=65535
+    op1.adsr.dr=6
+    op1.fixed = true
+    op1.wave = 4
+    op1.pitch = 0x2f000000
+    op1.outL = op1.outR = 65535
+}
+
+function BASS_______(channels, index) {
+    const op1 = channels[index].op1;
+    const op2 = channels[index].op2;
+    const op3 = channels[index].op3;
+    const op4 = channels[index].op4;
+
+    op1.adsr.ar=65535
+    op1.adsr.dr=1
+    op1.outL = op1.outR = 65535
+    op1.mi2 = 65535/7
+
+    op2.adsr.ar=65535
+    op2.adsr.dr=1
+
+    op3.adsr.ar=65535
+    op3.adsr.dr=1
+    op3.outL = op3.outR = 65535
+    op3.mi4 = 65535/7
+    op3.ml = 0
+
+    op4.adsr.ar=65535
+    op4.adsr.dr=1
+    op4.ml = 0
+}
+
+return function(t, sample) {
+  const t2 = round(t*sample)
+  CHORD______(cse1.channels, 0)
+  SET__PITCH_(cse1.channels, 0, sample, chord[0][t>>1&3])
+  CHORD______(cse1.channels, 1)
+  SET__PITCH_(cse1.channels, 1, sample, chord[1][t>>1&3])
+  const notea = note1(t)
+  const noteb = note2(t)
+
+  SUPERSAW___(cse1.channels, 2)
+  if (t2%(sample/2)==0) {
+    SET__PITCH_(cse1.channels, 2, sample, notea)
+    ResetEG(cse1.channels, 2)
+    randomPhase(cse1.channels, 2)
+  }
+  SUPERSAW___(cse1.channels, 3)
+  if (t2%(sample/4)==0) {
+    SET__PITCH_(cse1.channels, 3, sample, noteb)
+    ResetEG(cse1.channels, 3)
+    randomPhase(cse1.channels, 3)
+  }
+
+  KICK_______(cse1.channels, 4)
+  if (t2%(sample/2)==0) {
+    SET__PITCH_(cse1.channels, 4, sample, 263)
+    ResetEG(cse1.channels, 4)
+  }
+  if (cse1.channels[4].pitch >= 0x1000) { 
+      cse1.channels[4].sweepFreq = 0xfffff000
+  } else {
+      cse1.channels[4].sweepFreq = 0x00000000
+  }
+
+  HIHAT______(cse1.channels, 5)
+  if ((t2+sample/8)%(sample/4)==0) {
+    ResetEG(cse1.channels, 5)
+  }
+
+  HIHAT_OPEN_(cse1.channels, 6)
+  if ((t2+sample/4)%(sample/2)==0) {
+    ResetEG(cse1.channels, 6)
+  }
+
+  SNARE______(cse1.channels, 7)
+  if ((t2+sample/2)%(sample)==0) {
+    ResetEG(cse1.channels, 7)
+  }
+
+  BASS_______(cse1.channels, 8)
+  if (t2%(sample/4)==0 && (0b11000111 >> (t*4&7))&1) {
+    SET__PITCH_(cse1.channels, 8, sample, a4*f(note[t>>1&3])/2)
+    ResetEG(cse1.channels, 8)
+  }
+  SetVolume(cse1.channels, 8, 65535/((0x80-env[t*4&7])/4))
+
+  return cse1.clock()
+}

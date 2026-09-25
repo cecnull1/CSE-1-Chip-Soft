@@ -1,0 +1,321 @@
+class Table {
+    sine = Array.from({length: 65536}, (_, i) => sin(i*2*PI/65536)*32767+32767&0xffff)
+    tri = Array.from({length: 65536}, (_, i) => asin(sin(i*2*PI/65536))/PI*2*32767+32767&0xffff)
+    exp = Array.from({length: 65536}, (_, i) => exp(2*i/65536-2)*65535&0xffff)
+}
+
+const table = new Table()
+
+class FilterSVF {
+    cutoff = 1000
+    types = 1 // 0=None Filter, 1=LP, 2=HP, 4=BP
+    mod = 1    // 输入源
+    res = 128    // 共振
+    outL = 16384*2
+    outR = 16384*2
+    neg = 0
+
+    #buf1 = 0 // Left low
+    #buf2 = 0 // Left band
+    #buf3 = 0 // Right low
+    #buf4 = 0 // Right band
+
+    vfbL = 0
+    vfbR = 0
+
+    clock(input, filter2, filter3) {
+        const filter1 = this
+
+        // 参数掩码
+        this.cutoff &= 0xFFFF
+        this.types &= 0x0007
+        this.neg &= 0x0001
+        this.mod &= 0x000F
+        this.res &= 0x00FF
+        this.outL &= 0xFFFF
+        this.outR &= 0xFFFF
+        this.#buf1 &= 0xFFFFFFFF
+        this.#buf2 &= 0xFFFFFFFF
+        this.#buf3 &= 0xFFFFFFFF
+        this.#buf4 &= 0xFFFFFFFF
+        this.vfbL &= 0xFFFF
+        this.vfbR &= 0xFFFF
+        // 输入源选择
+        let inL = 0, inR = 0
+        if (this.mod & 1) { inL += input[0]; inR += input[1] }  // In
+        if (this.mod & 2) { inL += filter2.vfbL; inR += filter2.vfbR }  // F1
+        if (this.mod & 4) { inL += filter3.vfbL; inR += filter3.vfbR }  // F2
+        if (this.mod & 8) { inL += filter1.vfbL; inR += filter1.vfbR }  // F3
+
+        // 频率系数
+        const f = this.cutoff
+        const q = 0x100 - this.res
+
+        // 左声道
+        const lowL = this.#buf1
+        const bandL = this.#buf2
+        const highL = inL - lowL - ((q * bandL) >> 8)
+        const newLowL = lowL + ((f * bandL) >> 16)
+        const newBandL = bandL + ((f * highL) >> 16)
+
+        // 右声道
+        const lowR = this.#buf3
+        const bandR = this.#buf4
+        const highR = inR - lowR - ((q * bandR) >> 8)
+        const newLowR = lowR + ((f * bandR) >> 16)
+        const newBandR = bandR + ((f * highR) >> 16)
+
+        // 更新状态
+        this.#buf1 = newLowL & 0xFFFFFFFF
+        this.#buf2 = newBandL & 0xFFFFFFFF
+        this.#buf3 = newLowR & 0xFFFFFFFF
+        this.#buf4 = newBandR & 0xFFFFFFFF
+
+        // 选择输出类型
+        let outL = 0, outR = 0
+        if (this.types & 1) outL += newLowL
+        if (this.types & 2) outL += highL
+        if (this.types & 4) outL += newBandL
+        if (this.types & 1) outR += newLowR
+        if (this.types & 2) outR += highR
+        if (this.types & 4) outR += newBandR
+        if (this.types == 0) {outL += inL; outR += inR}
+
+        // 反相
+        if (this.neg) {
+            outL = -outL
+            outR = -outR
+        }
+
+        // 更新 VFB
+        this.vfbL = outL & 0xFFFF
+        this.vfbR = outR & 0xFFFF
+
+        return [outL * this.outL >> 16, outR * this.outR >> 16]
+    }
+}
+
+class ADSR {
+    ar = 0
+    dr = 0
+    sl = 0
+    sr = 0
+    rr = 0
+    envstate = 0
+    envvp = 3
+
+    clock() {
+   	this.ar &= 0xffff
+    	this.dr &= 0xffff
+    	this.sl &= 0xffff
+    	this.sr &= 0xffff
+    	this.rr &= 0xffff
+    	this.envstate &= 0x3
+    	this.envvp &= 0xffff
+      
+      switch(this.envstate) {
+        case 0: {
+                   this.envvp += this.ar
+                   if (this.envvp > 0xffff) { this.envvp = 0xffff, this.envstate += 1}
+                   break;
+                 }
+        case 1: {
+                   this.envvp -= this.dr
+                   if (this.envvp <= this.sl) {this.envvp = this.sl, this.envstate += 1}
+                   break;
+                 }
+        case 2: {
+                   this.envvp -= this.sr
+                   if (this.envvp <= 0) { this.envvp = 0, this.envstate += 1}
+                   break;
+                }
+        case 3: {
+                   this.envvp -= this.rr
+                   if (this.envvp <= 0) { this.envvp = 0}
+                   break;
+                 }
+      }
+    }
+
+    volume(_table) {
+        if (_table === undefined || _table === null) return table.exp[this.envvp]
+        return _table[this.envvp]
+    }
+}
+
+class Oper {
+    mi1 = 0
+    mi2 = 0
+    mi3 = 0
+    mi4 = 0
+    mi5 = 0
+    mi6 = 0
+    adsr = new ADSR()
+    pitch = 0
+    vfb = 0
+    phase = 0
+    duty = 32768
+
+    outL = 0
+    outR = 0
+
+    negL = 0
+    negR = 0
+    wave = 0
+
+    wavetable(index) {
+        switch(this.wave) {
+          case 0: return table.sine[index]
+          case 1: return table.tri[index]
+          case 2: return (index>this.duty)*65535
+          case 3: return index
+          case 4:
+        		if (this.phase & 0x80000000) {
+            	this.phase &= 0x7fffffff
+            	this.duty = (this.duty >> 1) | (((this.duty ^ (this.duty >> 2) ^ (this.duty >> 3) ^ (this.duty >> 5)) & 1) << 15)
+        		}
+        		return (this.duty & 1) * 65535
+        }
+        return 0
+    }
+
+    clock(op2, op3, op4, op5, op6) {
+     	const op1 = this
+
+    	this.mi1 &= 0xffff
+    	this.mi2 &= 0xffff
+    	this.mi3 &= 0xffff
+    	this.mi4 &= 0xffff
+    	this.mi5 &= 0xffff
+    	this.mi6 &= 0xffff
+    	this.pitch &= 0xffffffff
+    	this.vfb &= 0xffff
+    	this.phase &= 0xffffffff
+    	this.outL &= 0xffff
+    	this.outR &= 0xffff
+      this.negL &= 0x0001
+      this.negR &= 0x0001
+      this.wave &= 0x0007
+      this.duty &= 0xffff
+
+      this.vfb = this.wavetable(
+        (op1.phase>>>16)+
+        ((op1.vfb*op1.adsr.volume()>>>16)*op1.mi1>>13)+
+        ((op2.vfb*op2.adsr.volume()>>>16)*op1.mi2>>13)+
+        ((op3.vfb*op3.adsr.volume()>>>16)*op1.mi3>>13)+
+        ((op4.vfb*op4.adsr.volume()>>>16)*op1.mi4>>13)+
+        ((op5.vfb*op5.adsr.volume()>>>16)*op1.mi5>>13)+
+        ((op6.vfb*op6.adsr.volume()>>>16)*op1.mi6>>13)
+        &0xffff
+      )
+		this.phase += (this.pitch | 0)
+		this.phase &= 0xffffffff
+      this.adsr.clock()
+      return [(this.negL ? -1 : 1)*((this.vfb-0x8000)*this.adsr.volume()>>16)*this.outL>>16, (this.negR ? -1 : 1)*((this.vfb-0x8000)*this.adsr.volume()>>16)*this.outR>>16] // 溢出会自动符号转换...在这里恰好是预期行为
+    }
+}
+
+class CSE1Channel {
+  op1 = new Oper()
+  op2 = new Oper()
+  op3 = new Oper()
+  op4 = new Oper()
+  op5 = new Oper()
+  op6 = new Oper()
+  f1 = new FilterSVF()
+  f2 = new FilterSVF()
+  f3 = new FilterSVF()
+  outL = 0
+  outR = 0
+  clock() {
+    this.outL &= 0xffff
+    this.outR &= 0xffff
+
+    const o1 = this.op1.clock(this.op2, this.op3, this.op4, this.op5, this.op6)
+    const o2 = this.op2.clock(this.op1, this.op3, this.op4, this.op5, this.op6)
+    const o3 = this.op3.clock(this.op1, this.op2, this.op4, this.op5, this.op6)
+    const o4 = this.op4.clock(this.op1, this.op2, this.op3, this.op5, this.op6)
+    const o5 = this.op5.clock(this.op1, this.op2, this.op3, this.op4, this.op6)
+    const o6 = this.op6.clock(this.op1, this.op2, this.op3, this.op4, this.op5)
+    const sum = [o1[0]+o2[0]+o3[0]+o4[0]+o5[0]+o6[0]>>2, o1[1]+o2[1]+o3[1]+o4[1]+o5[1]+o6[1]>>2]
+
+    const o7 = this.f1.clock(sum, this.f2, this.f3)
+    const o8 = this.f2.clock(sum, this.f1, this.f3)
+    const o9 = this.f3.clock(sum, this.f1, this.f2)
+    return [o7[0]+o8[0]+o9[0]+(sum[0]*this.outL>>16), o7[1]+o8[1]+o9[1]+(sum[1]*this.outR>>16)]
+  }
+}
+
+function clamp(value, min1, max2) {
+    return min(max(value, min1), max2)
+}
+
+const f=(b)=>2**((b-69)/12)
+
+const notes1=[
+f(60),f(67), f(67), f(70),
+f(60),f(67), f(67), f(70),
+f(60),f(63), f(63), f(67),
+f(60),f(63), f(63), f(67),
+f(60),f(63), f(63), f(65),
+f(60),f(63), f(63), f(65),
+f(58),f(60), f(60), f(63),
+f(60),f(63), f(63), f(65)
+]
+
+const bpm = 120/120
+const a4 = 440
+
+const cse1 = new CSE1Channel()
+
+return function(t, sample) {
+
+const note1=notes1[t*2*bpm&31]*a4*2
+const note2=notes1[(t*4*bpm&3)+(t*bpm>>1<<2)&31]*a4
+  const t2 = round(t*sample)
+  cse1.op1.pitch = note2*2**32/sample/4
+  cse1.op2.pitch = cse1.op1.pitch
+  cse1.op1.adsr.ar = 32
+  cse1.op1.adsr.dr = 32
+  cse1.op1.adsr.sr = 1
+  cse1.op2.adsr.ar = 65535
+  cse1.op2.adsr.dr = 1
+  cse1.op1.adsr.sl = 60000
+  cse1.op1.adsr.envstate = (t2%(sample/4)==0?0:cse1.op1.adsr.envstate)
+  cse1.op2.adsr.envstate = (t2%(sample/4)==0?0:cse1.op2.adsr.envstate)
+  cse1.op1.wave = 2
+  cse1.op1.mi2 = 16384
+  cse1.op1.outL = 65535
+  cse1.op1.outR = 65535
+
+  cse1.op3.pitch = note1*2**32/sample/4
+  cse1.op4.pitch = cse1.op3.pitch
+  cse1.op3.adsr.ar = 32
+  cse1.op3.adsr.dr = 32
+  cse1.op3.adsr.sr = 1
+  cse1.op4.adsr.ar = 65535
+  cse1.op4.adsr.dr = 1
+  cse1.op3.adsr.sl = 60000
+  cse1.op3.adsr.envstate = (t2%(sample/2)==0?0:cse1.op3.adsr.envstate)
+  cse1.op4.adsr.envstate = (t2%(sample/2)==0?0:cse1.op4.adsr.envstate)
+  cse1.op3.wave = 2
+  cse1.op3.mi4 = 16384
+  cse1.op3.outL = 65535
+  cse1.op3.outR = 65535
+
+  cse1.op5.pitch = exp(-t*32%16)*384*2**32/sample // Kick
+  cse1.op5.wave = 2
+  cse1.op5.adsr.envvp = 65535
+  cse1.op5.outL = 65535
+  cse1.op5.outR = 65535
+
+  cse1.op6.pitch = 5000*2**32/sample // Snare
+  cse1.op6.wave = 4
+  cse1.op6.adsr.ar = 65535
+  cse1.op6.adsr.dr = 1
+  cse1.op6.adsr.envstate = ((t2+sample/2)%(sample)==0?0:cse1.op6.adsr.envstate)
+  cse1.op6.outL = 65535
+  cse1.op6.outR = 65535
+  const dac = cse1.clock()
+  return [dac[0]/65536, dac[1]/65536]
+}

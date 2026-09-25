@@ -1,0 +1,163 @@
+class Table {
+    sine = Array.from({length: 65536}, (_, i) => sin(i*2*PI/65536)*32767+32767&0xffff)
+    tri = Array.from({length: 65536}, (_, i) => asin(sin(i*2*PI/65536))/PI*2*32767+32767&0xffff)
+}
+
+const table = new Table()
+
+class ADSR {
+    ar = 0
+    dr = 0
+    sl = 0
+    sr = 0
+    rr = 0
+    envstate = 0
+    envvp = 3
+
+    clock() {
+   	this.ar &= 0xffff
+    	this.dr &= 0xffff
+    	this.sl &= 0xffff
+    	this.sr &= 0xffff
+    	this.rr &= 0xffff
+    	this.envstate &= 0x3
+    	this.envvp &= 0xffff
+      
+      switch(this.envstate) {
+        case 0: {
+                   this.envvp += this.ar
+                   if (this.envvp > 0xffff) { this.envvp = 0xffff, this.envstate += 1}
+                   break;
+                 }
+        case 1: {
+                   this.envvp -= this.dr
+                   if (this.envvp <= this.sl) {this.envvp = this.sl, this.envstate += 1}
+                   break;
+                 }
+        case 2: {
+                   this.envvp -= this.sr
+                   if (this.envvp <= 0) { this.envvp = 0, this.envstate += 1}
+                   break;
+                }
+        case 3: {
+                   this.envvp -= this.rr
+                   if (this.envvp <= 0) { this.envvp = 0}
+                   break;
+                 }
+      }
+    }
+}
+
+class Oper {
+    mi1 = 0
+    mi2 = 0
+    mi3 = 0
+    mi4 = 0
+    mi5 = 0
+    mi6 = 0
+    adsr = new ADSR()
+    pitch = 0
+    vfb = 0
+    phase = 0
+    duty = 32768
+
+    outL = 0
+    outR = 0
+
+    negL = 0
+    negR = 0
+    wave = 0
+
+    wavetable(index) {
+        switch(this.wave) {
+          case 0: return table.sine[index]
+          case 1: return table.tri[index]
+          case 2: return (index>this.duty)*65535
+          case 3: return index
+        }
+        return 0
+    }
+
+    clock(op2, op3, op4, op5, op6) {
+     	const op1 = this
+
+    	this.mi1 &= 0xffff
+    	this.mi2 &= 0xffff
+    	this.mi3 &= 0xffff
+    	this.mi4 &= 0xffff
+    	this.mi5 &= 0xffff
+    	this.mi6 &= 0xffff
+    	this.pitch &= 0xffffffff
+    	this.vfb &= 0xffff
+    	this.phase &= 0xffffffff
+    	this.outL &= 0xffff
+    	this.outR &= 0xffff
+      this.negL &= 0x0001
+      this.negR &= 0x0001
+      this.wave &= 0x0007
+      this.duty &= 0xffff
+
+      this.vfb = this.wavetable(
+        (op1.phase>>>16)+
+        ((op1.vfb*op1.adsr.envvp>>>16)*op1.mi1>>13)+
+        ((op2.vfb*op2.adsr.envvp>>>16)*op1.mi2>>13)+
+        ((op3.vfb*op3.adsr.envvp>>>16)*op1.mi3>>13)+
+        ((op4.vfb*op4.adsr.envvp>>>16)*op1.mi4>>13)+
+        ((op5.vfb*op5.adsr.envvp>>>16)*op1.mi5>>13)+
+        ((op6.vfb*op6.adsr.envvp>>>16)*op1.mi6>>13)
+        &0xffff
+      )
+
+    	this.phase += (this.pitch | 0)
+    	this.phase &= 0xffffffff
+      this.adsr.clock()
+      return [(this.negL ? -1 : 1)*((this.vfb-32768)*this.adsr.envvp>>16)*this.outL>>16, (this.negR ? -1 : 1)*((this.vfb-32768)*this.adsr.envvp>>16)*this.outR>>16] // 溢出会自动符号转换...在这里恰好是预期行为
+    }
+}
+
+class CSE1 {
+  op1 = new Oper()
+  op2 = new Oper()
+  op3 = new Oper()
+  op4 = new Oper()
+  op5 = new Oper()
+  op6 = new Oper()
+  clock() {
+    const o1 = this.op1.clock(this.op2, this.op3, this.op4, this.op5, this.op6)
+    const o2 = this.op2.clock(this.op1, this.op3, this.op4, this.op5, this.op6)
+    const o3 = this.op3.clock(this.op1, this.op3, this.op4, this.op5, this.op6)
+    const o4 = this.op4.clock(this.op1, this.op3, this.op4, this.op5, this.op6)
+    const o5 = this.op5.clock(this.op1, this.op3, this.op4, this.op5, this.op6)
+    const o6 = this.op6.clock(this.op1, this.op3, this.op4, this.op5, this.op6)
+    return [o1[0]/65536+o2[0]/65535+o3[0]/65535+o4[0]/65535+o5[0]/65535+o6[0]/65535, o1[1]/65536+o2[1]/65536+o3[1]/65536+o4[1]/65536+o5[1]/65536+o6[1]/65536]
+  }
+}
+
+const cse1 = new CSE1()
+
+const note = [
+60, 72, 84, 72, 84, 72, 84, 72, 60, 72, 84, 72, 84, 72, 84, 72,
+60, 72, 60, 72, 60, 72, 84, 72, 60, 72, 60, 72, 60, 72, 84, 72,
+60, 72, 60, 72, 60, 72, 60, 72, 60, 72, 60, 72, 60, 72, 60, 72,
+60, 72, 60, 72, 60, 72, 60, 72, 60, 72, 60, 72, 60, 72, 60, 72, 
+]
+
+return function(t, sample) {
+  const t2 = round(t*sample)
+  cse1.op1.pitch = (440*2**((note[t*4%64|0]-69)/12))*2**32/sample/4
+  cse1.op2.pitch = cse1.op1.pitch
+  cse1.op1.adsr.ar = 32
+  cse1.op1.adsr.dr = 32
+  cse1.op1.adsr.sr = 1
+  cse1.op2.adsr.ar = 65535
+  cse1.op2.adsr.dr = 1
+  cse1.op1.adsr.sl = 60000
+  cse1.op1.adsr.envstate = (t2%(sample/4)==0?0:cse1.op1.adsr.envstate)
+  cse1.op2.adsr.envstate = (t2%(sample/4)==0?0:cse1.op2.adsr.envstate)
+  cse1.op1.wave = 2
+  cse1.op1.mi2 = 16384
+  cse1.op1.mi1 = 00000
+  cse1.op1.outL = 65535
+  cse1.op1.outR = 65535
+  return cse1.clock()
+}
