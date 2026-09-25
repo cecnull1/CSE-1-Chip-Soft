@@ -1,0 +1,4 @@
+#ifndef LIBCSE1_LIBRARY_H
+#define LIBCSE1_LIBRARY_H
+
+#endif // LIBCSE1_LIBRARY_H
