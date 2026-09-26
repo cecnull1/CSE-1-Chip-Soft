@@ -236,7 +236,7 @@ namespace CSE1_PACKED {
         CSE1_CHANNELS CHANNELS;
         void clock(const WaveTable &wave_table) noexcept;
 
-        [[nodiscard]] CSE1_DOUBLE_SIG_REG CSE1_GET_SAMPLE(uint8_t ch) const noexcept;
+        CSE1_DOUBLE_SIG_REG CSE1_GET_SAMPLE(uint8_t ch) const noexcept;
 
         void hard_reset();
     };
